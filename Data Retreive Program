@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import JointState
+from std_msgs.msg import Float64MultiArray, Bool
+from opcua import Client
+import threading
+import time
+class OpcuaRos2Bridge(Node):
+    def __init__(self):
+        super().__init__('opcua_ros2_bridge')
+      
+        # === CONFIGURATION ===
+        self.fanuc_url = "opc.tcp://192.168.1.10:4880/FANUC-NanoUaServer"
+        self.keyence_url = "opc.tcp://192.168.1.10:4840"
+      
+        # IMPORTANT: Use UA Expert to find these exact strings
+        self.FANUC_TORQUE_NODEID = "ns=2;s=Robot.JointTorque"
+        self.KEYENCE_DM0_NODEID = "ns=2;s=DM0"
+        self.KEYENCE_FAULT_NODEID = "ns=2;s=PLC.FaultFlag"
+        # ROS 2 Setup
+        self.joint_pub = self.create_publisher(JointState, '/joint_states_from_opcua', 10)
+        self.plc_pub = self.create_publisher(Float64MultiArray, '/plc_data', 10)
+        self.create_subscription(Bool, '/fault_detected', self.send_fault_to_plc, 10)
+        # OPC UA Clients
+        self.fanuc_client = Client(self.fanuc_url)
+        self.keyence_client = Client(self.keyence_url)
+      
+        # Start background thread
+        self.thread = threading.Thread(target=self.opcua_loop, daemon=True)
+        self.thread.start()
+        self.get_logger().info("OPC UA Bridge Initialized. Attempting connections...")
+    def safe_connect(self, client, name):
+        """Helper to connect/reconnect safely."""
+        try:
+            client.connect()
+            self.get_logger().info(f"Connected to {name}")
+            return True
+        except Exception as e:
+            self.get_logger().error(f"Failed to connect to {name}: {e}")
+            return False
+    def opcua_loop(self):
+        fanuc_connected = False
+        keyence_connected = False
+        while rclpy.ok():
+            # 1. Check/Maintain Fanuc Connection
+            if not fanuc_connected:
+                fanuc_connected = self.safe_connect(self.fanuc_client, "Fanuc")
+            else:
+                try:
+                    node = self.fanuc_client.get_node(self.FANUC_TORQUE_NODEID)
+                    vals = node.get_value()
+                  
+                    msg = JointState()
+                    msg.header.stamp = self.get_clock().now().to_msg()
+                    msg.name = [f"J{i+1}" for i in range(6)]
+                    msg.effort = vals if isinstance(vals, list) else [float(vals)] * 6
+                    self.joint_pub.publish(msg)
+                except Exception as e:
+                    self.get_logger().warn(f"Fanuc Read Error: {e}")
+                    fanuc_connected = False # Trigger reconnect
+            # 2. Check/Maintain Keyence Connection
+            if not keyence_connected:
+                keyence_connected = self.safe_connect(self.keyence_client, "Keyence")
+            else:
+                try:
+                    node = self.keyence_client.get_node(self.KEYENCE_DM0_NODEID)
+                    val = node.get_value()
+                  
+                    msg = Float64MultiArray()
+                    msg.data = [float(val)] if not isinstance(val, list) else [float(x) for x in val]
+                    self.plc_pub.publish(msg)
+                except Exception as e:
+                    self.get_logger().warn(f"Keyence Read Error: {e}")
+                    keyence_connected = False # Trigger reconnect
+            time.sleep(0.1) # 10Hz loop
+    def send_fault_to_plc(self, msg):
+        """Writes fault bit to PLC immediately upon ROS message."""
+        try:
+            # We use the existing persistent client
+            node = self.keyence_client.get_node(self.KEYENCE_FAULT_NODEID)
+            # variant type check might be needed depending on PLC setup
+            node.set_value(msg.data)
+            self.get_logger().warn(f"Fault status {msg.data} written to PLC.")
+        except Exception as e:
+            self.get_logger().error(f"Could not write fault to PLC: {e}")
+def main():
+    rclpy.init()
+    node = OpcuaRos2Bridge()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.fanuc_client.disconnect()
+        node.keyence_client.disconnect()
+        node.destroy_node()
+        rclpy.shutdown()
+if __name__ == '__main__':
+    main()
